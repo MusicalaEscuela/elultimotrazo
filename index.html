@@ -1,0 +1,704 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>El Último Trazo</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#000;display:flex;flex-direction:column;justify-content:center;align-items:center;height:100vh;overflow:hidden;font-family:Georgia,serif}
+canvas{display:block;box-shadow:0 0 80px rgba(50,40,120,.5),0 0 120px rgba(20,10,60,.8)}
+#hint{color:#303055;font-size:11px;margin-top:8px;letter-spacing:.5px}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hint">← → Mover &nbsp;·&nbsp; Espacio / W / ↑ Saltar (doble salto) &nbsp;·&nbsp; Z Atacar</div>
+<script>
+'use strict';
+// ================================================================
+//  EL ÚLTIMO TRAZO — metroidvania de artes plásticas
+//  3 salas · 2 tipos de enemigos · 1 jefe final
+// ================================================================
+const C=document.getElementById('c');
+const ctx=C.getContext('2d');
+C.width=800; C.height=480;
+const W=C.width, H=C.height;
+
+// ── PALETA ──────────────────────────────────────────────────────
+const COL={
+  plat:'#131528', platTop:'#22244a', platShadow:'#08090f',
+  playerBody:'#cccde8', playerGlow:'#5555bb', cloak:'#1d1f3e',
+  brush:'#c8a44a',
+  mancha:'#6b1a28', mancha2:'#a52030',
+  pincel:'#184a5a', pincel2:'#1e7090',
+  bossFrame:'#3a1808', bossGlow:'#300820',
+  hp:'#b03030', hpEmpty:'#1e0808',
+};
+const PAINT=['#c0392b','#2471a3','#d4ac0d','#1e8449','#7d3c98','#ca6f1e','#e8e8e8'];
+
+// ── INPUT ────────────────────────────────────────────────────────
+const K={}, JD=new Set();
+addEventListener('keydown',e=>{if(!K[e.code])JD.add(e.code);K[e.code]=true;e.preventDefault();});
+addEventListener('keyup',e=>{K[e.code]=false;});
+
+// ── MATH ─────────────────────────────────────────────────────────
+const lerp=(a,b,t)=>a+(b-a)*t;
+const clamp=(v,lo,hi)=>Math.max(lo,Math.min(hi,v));
+const rnd=(a,b)=>a+Math.random()*(b-a);
+const rndI=(a,b)=>Math.floor(rnd(a,b+1));
+const hit=(a,b)=>a.x<b.x+b.w&&a.x+a.w>b.x&&a.y<b.y+b.h&&a.y+a.h>b.y;
+
+// ── PARTÍCULAS ───────────────────────────────────────────────────
+const PARTS=[];
+function pSpawn(x,y,n,col){
+  for(let i=0;i<n;i++){
+    const a=rnd(0,Math.PI*2), s=rnd(1.5,5.5);
+    PARTS.push({x,y,vx:Math.cos(a)*s,vy:Math.sin(a)*s-rnd(0,2.5),
+      sz:rnd(2,7),life:rnd(.4,1.1),col:col||PAINT[rndI(0,PAINT.length-1)]});
+  }
+}
+function pDust(x,y,n){
+  for(let i=0;i<n;i++)
+    PARTS.push({x,y,vx:rnd(-1.5,1.5),vy:rnd(-2,-.3),sz:rnd(1,3.5),life:rnd(.3,.6),col:'#2a2c50'});
+}
+function pUpdate(dt){
+  for(let i=PARTS.length-1;i>=0;i--){
+    const p=PARTS[i];
+    p.vy+=.18; p.vx*=.88; p.vy*=.95; p.x+=p.vx; p.y+=p.vy; p.life-=dt;
+    if(p.life<=0)PARTS.splice(i,1);
+  }
+}
+function pDraw(cx,cy){
+  PARTS.forEach(p=>{
+    ctx.globalAlpha=clamp(p.life/.4,0,1)*.9;
+    ctx.fillStyle=p.col;
+    ctx.beginPath();
+    ctx.ellipse(p.x-cx,p.y-cy,p.sz,p.sz*.65,Math.atan2(p.vy,p.vx),0,Math.PI*2);
+    ctx.fill();
+  });
+  ctx.globalAlpha=1;
+}
+
+// ── CÁMARA ───────────────────────────────────────────────────────
+const CAM={x:0,y:0,sh:0,shx:0,shy:0};
+function camUpdate(tx,ty,rw,rh){
+  CAM.x=lerp(CAM.x,clamp(tx-W/2,0,rw-W),.1);
+  CAM.y=lerp(CAM.y,clamp(ty-H/2,0,rh-H),.1);
+  if(CAM.sh>0){
+    CAM.sh=Math.max(0,CAM.sh-.055);
+    CAM.shx=rnd(-CAM.sh*9,CAM.sh*9); CAM.shy=rnd(-CAM.sh*9,CAM.sh*9);
+  } else { CAM.shx=0; CAM.shy=0; }
+}
+
+// ── HELPER DIBUJO ────────────────────────────────────────────────
+function rRect(x,y,w,h,r){
+  ctx.beginPath();
+  ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r);
+  ctx.arcTo(x+w,y+h,x,y+h,r); ctx.arcTo(x,y+h,x,y,r);
+  ctx.arcTo(x,y,x+w,y,r); ctx.closePath();
+}
+
+// ── COLISIONES ───────────────────────────────────────────────────
+function resolveX(e,plats){
+  plats.forEach(p=>{
+    if(!hit(e,p))return;
+    if(e.vx>0)e.x=p.x-e.w; else if(e.vx<0)e.x=p.x+p.w;
+    e.vx=0;
+  });
+}
+function resolveY(e,plats){
+  plats.forEach(p=>{
+    if(!hit(e,p))return;
+    if(e.vy>=0){e.y=p.y-e.h;e.onGround=true;} else e.y=p.y+p.h;
+    e.vy=0;
+  });
+}
+
+// ── DATOS DE SALAS ────────────────────────────────────────────────
+const ROOMS=[
+  { name:'Galería de Entrada', w:2400, h:480, boss:false,
+    plats:[
+      {x:0,y:440,w:2400,h:40},
+      {x:280,y:355,w:115,h:14},{x:470,y:295,w:100,h:14},
+      {x:670,y:355,w:100,h:14},{x:875,y:272,w:130,h:14},
+      {x:1070,y:350,w:100,h:14},{x:1260,y:288,w:120,h:14},
+      {x:1470,y:360,w:200,h:14},{x:1755,y:312,w:120,h:14},
+      {x:1970,y:355,w:145,h:14},{x:2190,y:295,w:105,h:14},
+      {x:-20,y:0,w:20,h:480},{x:2400,y:0,w:20,h:480},
+    ],
+    enems:[
+      {t:'mancha',x:410,y:420},{t:'mancha',x:775,y:420},
+      {t:'mancha',x:985,y:420},{t:'pincel',x:1180,y:285},
+      {t:'mancha',x:1540,y:420},{t:'pincel',x:1800,y:205},
+      {t:'mancha',x:2100,y:420},
+    ],
+    transit:{x:2372,y:180,w:28,h:262} },
+
+  { name:'Corredor de Esculturas', w:2000, h:480, boss:false,
+    plats:[
+      {x:0,y:440,w:2000,h:40},
+      {x:130,y:370,w:80,h:14},{x:305,y:312,w:80,h:14},
+      {x:475,y:260,w:80,h:14},{x:645,y:312,w:80,h:14},
+      {x:815,y:362,w:80,h:14},{x:985,y:282,w:100,h:14},
+      {x:1185,y:348,w:120,h:14},{x:1390,y:278,w:100,h:14},
+      {x:1590,y:365,w:165,h:14},
+      {x:-20,y:0,w:20,h:480},{x:2000,y:0,w:20,h:480},
+    ],
+    enems:[
+      {t:'mancha',x:275,y:420},{t:'pincel',x:480,y:215},
+      {t:'mancha',x:670,y:420},{t:'mancha',x:895,y:420},
+      {t:'pincel',x:1095,y:248},{t:'pincel',x:1295,y:202},
+      {t:'mancha',x:1595,y:420},{t:'mancha',x:1820,y:420},
+    ],
+    transit:{x:1973,y:180,w:27,h:262} },
+
+  { name:'Cámara del Lienzo', w:1400, h:480, boss:true,
+    plats:[
+      {x:0,y:440,w:1400,h:40},
+      {x:180,y:350,w:90,h:14},{x:600,y:308,w:90,h:14},
+      {x:1020,y:350,w:90,h:14},
+      {x:-20,y:0,w:20,h:480},{x:1400,y:0,w:20,h:480},
+    ],
+    enems:[],transit:null },
+];
+
+// ── JUGADOR ──────────────────────────────────────────────────────
+let PL;
+function mkPlayer(x,y){
+  return {x,y,w:24,h:36,vx:0,vy:0,onGround:false,jumps:2,coyote:0,
+    facing:1,hp:5,maxHp:5,
+    atk:false,atkT:0,atkCd:0,atkHits:new Set(),
+    inv:0,dead:false,wAnim:0};
+}
+function doAtk(){
+  if(PL.atkCd>0||PL.dead)return;
+  PL.atk=true; PL.atkT=.18; PL.atkCd=.32;
+  PL.atkHits.clear();
+  pSpawn(PL.x+PL.facing*28,PL.y+12,4,COL.brush);
+}
+function atkBox(){
+  if(!PL.atk)return null;
+  return {x:PL.x+(PL.facing>0?PL.w:-54),y:PL.y-4,w:54,h:PL.h+8};
+}
+function plUpdate(dt,plats){
+  if(PL.dead)return;
+  let mx=0;
+  if(K.ArrowLeft||K.KeyA){mx=-1;PL.facing=-1;}
+  if(K.ArrowRight||K.KeyD){mx=1;PL.facing=1;}
+  PL.vx=mx*3.9;
+  if(JD.has('Space')||JD.has('ArrowUp')||JD.has('KeyW')){
+    if(PL.coyote>0||PL.jumps>0){
+      PL.vy=-11.6; if(PL.coyote<=0)PL.jumps--; PL.coyote=0;
+      pDust(PL.x+PL.w/2,PL.y+PL.h,6);
+    }
+  }
+  if(JD.has('KeyZ')||JD.has('KeyX')||JD.has('KeyJ'))doAtk();
+  PL.vy=Math.min(PL.vy+.45,14);
+  PL.x+=PL.vx; resolveX(PL,plats);
+  PL.y+=PL.vy; PL.onGround=false; resolveY(PL,plats);
+  if(PL.onGround){PL.coyote=.12;PL.jumps=2;} else PL.coyote-=dt;
+  if(PL.atkT>0){PL.atkT-=dt;if(PL.atkT<=0)PL.atk=false;}
+  if(PL.atkCd>0)PL.atkCd-=dt;
+  if(PL.inv>0)PL.inv-=dt;
+  if(PL.onGround&&Math.abs(PL.vx)>.5)PL.wAnim+=dt*9;
+  else if(PL.onGround)PL.wAnim=0;
+}
+function plDraw(cx,cy){
+  if(PL.inv>0&&(PL.inv*10|0)%2===0)return;
+  const px=PL.x-cx+CAM.shx, py=PL.y-cy+CAM.shy;
+  const d=PL.facing, bob=PL.onGround?Math.sin(PL.wAnim)*1.5:0;
+  ctx.save();
+  ctx.translate(px+PL.w/2, py+PL.h/2+bob);
+  // Halo tenue
+  ctx.shadowColor=COL.playerGlow; ctx.shadowBlur=16;
+  ctx.fillStyle=COL.playerBody;
+  rRect(-9,-14,18,22,5); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(0,-22,9,9,0,0,Math.PI*2); ctx.fill();
+  ctx.shadowBlur=0;
+  // Capa
+  ctx.fillStyle=COL.cloak;
+  ctx.beginPath(); ctx.moveTo(-11,2); ctx.lineTo(-16,18); ctx.lineTo(16,18); ctx.lineTo(11,2); ctx.closePath(); ctx.fill();
+  // Ojo
+  ctx.shadowColor='#9090ee'; ctx.shadowBlur=6;
+  ctx.fillStyle='#9090ee';
+  ctx.beginPath(); ctx.ellipse(d*3,-23,2.5,4,0,0,Math.PI*2); ctx.fill();
+  ctx.shadowBlur=0;
+  // Pincel
+  ctx.shadowColor=COL.brush; ctx.shadowBlur=8;
+  if(PL.atk){
+    const sw=PL.atkT*6;
+    ctx.strokeStyle=COL.brush; ctx.lineWidth=3; ctx.lineCap='round';
+    ctx.beginPath(); ctx.moveTo(d*5,-5); ctx.lineTo(d*48,-20+Math.sin(sw)*14); ctx.stroke();
+    ctx.strokeStyle='#908048'; ctx.lineWidth=1.5;
+    for(let i=0;i<5;i++){
+      ctx.beginPath(); ctx.moveTo(d*44,-22+i*5);
+      ctx.lineTo(d*58,-26+i*5+Math.sin(sw*2+i)*4); ctx.stroke();
+    }
+  } else {
+    ctx.strokeStyle=COL.brush; ctx.lineWidth=2.5; ctx.lineCap='round';
+    ctx.beginPath(); ctx.moveTo(d*6,4); ctx.lineTo(d*22,-16); ctx.stroke();
+  }
+  ctx.restore();
+}
+
+// ── DAÑO AL JUGADOR ───────────────────────────────────────────────
+function hurtPl(dmg){
+  if(PL.inv>0||PL.dead)return;
+  PL.hp-=dmg; PL.inv=1.5; CAM.sh=.7;
+  PL.vy=-6; pSpawn(PL.x+PL.w/2,PL.y+PL.h/2,7,COL.hp);
+  if(PL.hp<=0){
+    PL.hp=0; PL.dead=true;
+    pSpawn(PL.x+PL.w/2,PL.y+PL.h/2,22,COL.playerBody);
+    setTimeout(()=>setState('dead'),1600);
+  }
+}
+
+// ── ENEMIGOS ─────────────────────────────────────────────────────
+let ENEMS=[], eid=0;
+function mkEnemy(d){
+  const id=eid++;
+  if(d.t==='mancha')
+    return {id,type:'mancha',x:d.x,y:d.y,w:30,h:24,vx:0,vy:0,
+      hp:3,maxHp:3,onGround:false,facing:-1,alive:true,
+      aggro:265,atkCd:0,wob:0,wDir:1};
+  return {id,type:'pincel',x:d.x,y:d.y,w:32,h:14,vx:-1,vy:0,
+    hp:2,maxHp:2,alive:true,aggro:300,atkCd:0,
+    fa:Math.random()*Math.PI*2,sy:d.y};
+}
+function eUpdate(dt,plats){
+  const atk=atkBox();
+  for(let i=ENEMS.length-1;i>=0;i--){
+    const e=ENEMS[i]; if(!e.alive)continue;
+    const dx=PL.x-e.x, dy=PL.y-e.y, dist=Math.sqrt(dx*dx+dy*dy);
+    if(e.type==='mancha'){
+      e.wob+=dt*4*e.wDir; if(Math.abs(e.wob)>.45)e.wDir*=-1;
+      if(dist<e.aggro&&!PL.dead){e.facing=dx>0?1:-1; e.vx=e.facing*1.7;}
+      else e.vx*=.85;
+      e.vy=Math.min(e.vy+.45,14);
+      e.x+=e.vx; resolveX(e,plats);
+      e.y+=e.vy; e.onGround=false; resolveY(e,plats);
+      if(dist<28&&e.atkCd<=0&&!PL.dead){hurtPl(1);e.atkCd=.9;}
+      if(e.atkCd>0)e.atkCd-=dt;
+    } else {
+      e.fa+=dt*1.6; e.y=e.sy+Math.sin(e.fa)*28;
+      if(dist<e.aggro&&!PL.dead){e.vx=lerp(e.vx,(dx>0?1:-1)*2,.06);e.facing=dx>0?1:-1;}
+      e.x+=e.vx;
+      if(dist<24&&e.atkCd<=0&&!PL.dead){hurtPl(1);e.atkCd=1.1;}
+      if(e.atkCd>0)e.atkCd-=dt;
+    }
+    if(atk&&!PL.atkHits.has(e.id)&&hit(atk,e)){
+      PL.atkHits.add(e.id); e.hp--; CAM.sh=.25;
+      pSpawn(e.x+e.w/2,e.y+e.h/2,9,e.type==='mancha'?COL.mancha2:COL.pincel2);
+      if(e.hp<=0){e.alive=false;pSpawn(e.x+e.w/2,e.y+e.h/2,16,PAINT[rndI(0,PAINT.length-1)]);}
+    }
+    if(!e.alive)ENEMS.splice(i,1);
+  }
+}
+function eDraw(cx,cy){
+  ENEMS.forEach(e=>{
+    const ex=e.x-cx+CAM.shx, ey=e.y-cy+CAM.shy;
+    ctx.save();
+    ctx.translate(ex+e.w/2, ey+e.h/2);
+    if(e.type==='mancha'){
+      const sc=1+Math.sin(e.wob)*.09;
+      ctx.save(); ctx.scale(sc,2-sc);
+      ctx.shadowColor=COL.mancha2; ctx.shadowBlur=10;
+      ctx.fillStyle=COL.mancha;
+      ctx.beginPath(); ctx.ellipse(0,0,e.w/2,e.h/2,0,0,Math.PI*2); ctx.fill();
+      ctx.fillStyle=COL.mancha2;
+      ctx.beginPath(); ctx.ellipse(-4,-5,5,4,-.3,0,Math.PI*2); ctx.fill();
+      ctx.shadowBlur=0;
+      ctx.fillStyle='#ee3333';
+      ctx.beginPath(); ctx.ellipse(-6,-4,4,4.5,0,0,Math.PI*2); ctx.ellipse(6,-4,4,4.5,0,0,Math.PI*2); ctx.fill();
+      ctx.fillStyle='#ff0000';
+      ctx.beginPath(); ctx.ellipse(-6,-4,2,2.5,0,0,Math.PI*2); ctx.ellipse(6,-4,2,2.5,0,0,Math.PI*2); ctx.fill();
+      ctx.restore();
+    } else {
+      if(e.vx<0)ctx.scale(-1,1);
+      ctx.shadowColor=COL.pincel2; ctx.shadowBlur=12;
+      ctx.fillStyle='#5a3a10'; rRect(-e.w/2,-3,e.w*.65,6,2); ctx.fill();
+      ctx.fillStyle='#888'; rRect(e.w*.08,-4,8,8,1); ctx.fill();
+      ctx.fillStyle=COL.pincel2;
+      for(let i=0;i<6;i++){
+        ctx.beginPath();
+        ctx.moveTo(e.w*.16+8,-4+i*1.3);
+        ctx.lineTo(e.w*.47,-6+i*2.2+Math.sin(e.fa+i)*2.5);
+        ctx.lineTo(e.w*.49,-5+i*2.2); ctx.closePath(); ctx.fill();
+      }
+      ctx.shadowBlur=0; ctx.fillStyle='#44aaff';
+      ctx.beginPath(); ctx.ellipse(-e.w/4,-1,3,3,0,0,Math.PI*2); ctx.fill();
+    }
+    // barra de vida
+    ctx.shadowBlur=0;
+    const bw=28;
+    ctx.fillStyle='#0e0e0e'; ctx.fillRect(-bw/2,-e.h/2-12,bw,5);
+    ctx.fillStyle=COL.hp; ctx.fillRect(-bw/2,-e.h/2-12,bw*(e.hp/e.maxHp),5);
+    ctx.restore();
+  });
+}
+
+// ── JEFE: EL LIENZO CORRUPTO ─────────────────────────────────────
+let BOSS=null;
+function mkBoss(){
+  return {x:460,y:90,w:210,h:270,
+    hp:30,maxHp:30,phase:1,alive:true,inv:0,
+    atkTimer:0,atkInt:2.2,
+    projs:[],wob:0,floatA:0,
+    entryT:2.8,active:false};
+}
+function bossShoot(){
+  if(!BOSS||!BOSS.alive)return;
+  const cx=BOSS.x+BOSS.w/2, cy=BOSS.y+BOSS.h/2;
+  const n=BOSS.phase===1?3:5, spd=BOSS.phase===1?3.5:4.8;
+  for(let i=0;i<n;i++){
+    const a=Math.PI/2+(i-(n-1)/2)*.38;
+    BOSS.projs.push({x:cx,y:cy,vx:Math.cos(a)*spd,vy:Math.sin(a)*spd,
+      r:9,col:PAINT[rndI(0,PAINT.length-1)],life:3.5});
+  }
+  if(BOSS.phase===2){
+    const ddx=PL.x-cx, ddy=PL.y-cy, mg=Math.sqrt(ddx*ddx+ddy*ddy)||1;
+    BOSS.projs.push({x:cx,y:cy,vx:(ddx/mg)*5.8,vy:(ddy/mg)*5.8,r:11,col:'#c0392b',life:3.5});
+  }
+}
+function bossUpdate(dt,plats){
+  if(!BOSS||!BOSS.alive)return;
+  if(BOSS.entryT>0){BOSS.entryT-=dt;return;}
+  BOSS.active=true;
+  BOSS.floatA+=dt*.75; BOSS.wob+=dt*2.5;
+  BOSS.y=90+Math.sin(BOSS.floatA)*18;
+  if(BOSS.hp<=BOSS.maxHp/2&&BOSS.phase===1){
+    BOSS.phase=2; BOSS.atkInt=1.35; CAM.sh=1.8;
+    pSpawn(BOSS.x+BOSS.w/2,BOSS.y+BOSS.h/2,30,'#c0392b');
+  }
+  BOSS.atkTimer+=dt;
+  if(BOSS.atkTimer>=BOSS.atkInt){BOSS.atkTimer=0;bossShoot();}
+  for(let i=BOSS.projs.length-1;i>=0;i--){
+    const p=BOSS.projs[i];
+    p.vy+=.1; p.x+=p.vx; p.y+=p.vy; p.life-=dt;
+    let died=p.life<=0;
+    for(const pl of plats)if(hit({x:p.x-p.r,y:p.y-p.r,w:p.r*2,h:p.r*2},pl)){died=true;break;}
+    const pdx=PL.x+PL.w/2-p.x, pdy=PL.y+PL.h/2-p.y;
+    if(!PL.dead&&Math.sqrt(pdx*pdx+pdy*pdy)<p.r+13){hurtPl(1);died=true;}
+    if(died){pSpawn(p.x,p.y,5,p.col);BOSS.projs.splice(i,1);}
+  }
+  if(BOSS.inv>0)BOSS.inv-=dt;
+  const atk=atkBox();
+  if(atk&&BOSS.inv<=0&&!PL.atkHits.has('boss')&&hit(atk,{x:BOSS.x,y:BOSS.y,w:BOSS.w,h:BOSS.h})){
+    PL.atkHits.add('boss'); BOSS.hp--; BOSS.inv=.35; CAM.sh=.5;
+    pSpawn(BOSS.x+BOSS.w/2,BOSS.y+rnd(0,BOSS.h),14);
+    if(BOSS.hp<=0){
+      BOSS.alive=false; CAM.sh=2.5;
+      for(let i=0;i<7;i++)
+        setTimeout(()=>pSpawn(BOSS.x+rnd(0,BOSS.w),BOSS.y+rnd(0,BOSS.h),20),i*280);
+      setTimeout(()=>setState('win'),3200);
+    }
+  }
+}
+function bossDraw(cx,cy){
+  if(!BOSS)return;
+  if(!BOSS.active){
+    // Intro fade-in
+    const t=clamp(1-(BOSS.entryT/2.8),0,1);
+    ctx.globalAlpha=t;
+  }
+  const bx=BOSS.x-cx+CAM.shx, by=BOSS.y-cy+CAM.shy;
+  ctx.save();
+  ctx.translate(bx+BOSS.w/2, by+BOSS.h/2);
+  const pu=.97+Math.sin(BOSS.wob)*.03; ctx.scale(pu,pu);
+  // Marco exterior
+  ctx.shadowColor=BOSS.phase===2?'#600010':'#200030'; ctx.shadowBlur=BOSS.active?38:0;
+  ctx.fillStyle=COL.bossFrame; rRect(-BOSS.w/2,-BOSS.h/2,BOSS.w,BOSS.h,10); ctx.fill();
+  const mg=18, iw=BOSS.w-mg*2, ih=BOSS.h-mg*2;
+  const ox=-BOSS.w/2+mg, oy=-BOSS.h/2+mg;
+  // Lienzo interior
+  ctx.shadowBlur=0; ctx.fillStyle='#140a04';
+  ctx.fillRect(ox,oy,iw,ih);
+  // Trazos de pintura (clipeados)
+  ctx.save();
+  ctx.beginPath(); ctx.rect(ox,oy,iw,ih); ctx.clip();
+  const t2=BOSS.wob;
+  PAINT.forEach((col,i)=>{
+    ctx.strokeStyle=col; ctx.lineWidth=3.5;
+    ctx.globalAlpha=.3+Math.sin(t2+i)*.18;
+    ctx.beginPath(); ctx.moveTo(ox,oy+ih*(i/PAINT.length));
+    for(let sx=0;sx<=iw;sx+=14)
+      ctx.lineTo(ox+sx, oy+ih*(i/PAINT.length)+Math.sin(sx*.07+t2+i*.9)*30);
+    ctx.stroke();
+  });
+  ctx.globalAlpha=1; ctx.restore();
+  // Ojos
+  const eyY=-BOSS.h*.08;
+  ctx.shadowColor=BOSS.phase===2?'#ff0000':'#cc2200'; ctx.shadowBlur=BOSS.active?25:4;
+  ctx.fillStyle=BOSS.phase===2?'#ff0000':'#cc3300';
+  ctx.beginPath(); ctx.ellipse(-30,eyY,20,24,0,0,Math.PI*2); ctx.ellipse(30,eyY,20,24,0,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='#08030a';
+  const ex2=Math.cos(BOSS.floatA)*4, ey2=Math.sin(BOSS.floatA)*4;
+  ctx.beginPath(); ctx.ellipse(-30+ex2,eyY+ey2,9,12,0,0,Math.PI*2); ctx.ellipse(30+ex2,eyY+ey2,9,12,0,0,Math.PI*2); ctx.fill();
+  // Boca
+  ctx.strokeStyle=BOSS.phase===2?'#ff2200':'#a82200'; ctx.lineWidth=5; ctx.lineCap='round'; ctx.shadowBlur=10;
+  ctx.beginPath(); ctx.moveTo(-44,BOSS.h*.14); ctx.quadraticCurveTo(0,BOSS.h*.14+Math.sin(BOSS.floatA*2)*22,44,BOSS.h*.14); ctx.stroke();
+  // Placa con nombre
+  ctx.shadowBlur=0; ctx.fillStyle=COL.bossFrame;
+  rRect(-BOSS.w/2,BOSS.h/2-24,BOSS.w,24,5); ctx.fill();
+  ctx.fillStyle='#d4a060'; ctx.font='bold 11px Georgia,serif'; ctx.textAlign='center';
+  ctx.fillText('EL LIENZO CORRUPTO',0,BOSS.h/2-7);
+  ctx.restore(); ctx.globalAlpha=1;
+  // Proyectiles
+  BOSS.projs.forEach(p=>{
+    const px=p.x-cx+CAM.shx, py=p.y-cy+CAM.shy;
+    ctx.save(); ctx.shadowColor=p.col; ctx.shadowBlur=14;
+    ctx.fillStyle=p.col; ctx.beginPath();
+    ctx.ellipse(px,py,p.r,p.r*.75,Math.atan2(p.vy,p.vx),0,Math.PI*2); ctx.fill(); ctx.restore();
+  });
+  // Barra de vida del jefe (fija en pantalla)
+  if(BOSS.alive&&BOSS.active){
+    const bw=400, bh=11, bx2=W/2-200, bby=H-38;
+    ctx.fillStyle='#060606'; ctx.fillRect(bx2-3,bby-3,bw+6,bh+6);
+    ctx.fillStyle='#2a0808'; ctx.fillRect(bx2,bby,bw,bh);
+    const pct=BOSS.hp/BOSS.maxHp;
+    ctx.fillStyle=BOSS.phase===2?'#ff2200':'#902020';
+    ctx.shadowColor=ctx.fillStyle; ctx.shadowBlur=10;
+    ctx.fillRect(bx2,bby,bw*pct,bh); ctx.shadowBlur=0;
+    ctx.fillStyle='#c8a060'; ctx.font='bold 10px Georgia,serif'; ctx.textAlign='center';
+    ctx.fillText('EL LIENZO CORRUPTO',W/2,bby-8);
+    if(BOSS.phase===2){ctx.fillStyle='#ff4400'; ctx.font='10px Georgia,serif'; ctx.fillText('— FASE FINAL —',W/2,bby+bh+14);}
+  }
+}
+
+// ── DIBUJO DE SALA ────────────────────────────────────────────────
+function drawBG(room,cx,cy){
+  const g=ctx.createLinearGradient(0,0,0,H);
+  g.addColorStop(0,room.boss?'#030408':'#07080e');
+  g.addColorStop(1,room.boss?'#090614':'#0c0d1c');
+  ctx.fillStyle=g; ctx.fillRect(0,0,W,H);
+  // Motas de polvo flotantes
+  const s=Date.now()/60;
+  for(let i=0;i<14;i++){
+    const px=((i*137+s*.4)%room.w)-cx;
+    const py=((i*97+s*.22)%H);
+    if(px>-4&&px<W+4){
+      ctx.globalAlpha=.015+(i%4)*.006;
+      ctx.fillStyle='#aaaacc';
+      ctx.beginPath(); ctx.arc(px,py,1,0,Math.PI*2); ctx.fill();
+    }
+  }
+  ctx.globalAlpha=1;
+}
+function drawPlats(room,cx,cy){
+  const sx=cx+CAM.shx, sy=cy+CAM.shy;
+  room.plats.forEach((p,i)=>{
+    if(i>=room.plats.length-2)return;
+    const px=p.x-sx, py=p.y-sy;
+    if(px>-p.w-20&&px<W+20){
+      ctx.fillStyle='#06070e'; ctx.fillRect(px+3,py+5,p.w,p.h);
+      ctx.fillStyle=COL.plat; ctx.fillRect(px,py,p.w,p.h);
+      ctx.fillStyle=COL.platTop; ctx.fillRect(px,py,p.w,3);
+      // manchas de pintura decorativas
+      const n=Math.floor(p.w/75);
+      for(let s=0;s<n;s++){
+        ctx.globalAlpha=.11; ctx.fillStyle=PAINT[(i*3+s)%PAINT.length];
+        ctx.beginPath(); ctx.ellipse(px+(s+.5)*(p.w/n),py+p.h/2,12,5,0,0,Math.PI*2); ctx.fill();
+        ctx.globalAlpha=1;
+      }
+    }
+  });
+  if(cx<60){
+    ctx.fillStyle='#282848'; ctx.font='10px Georgia,serif'; ctx.textAlign='center';
+    ctx.fillText(room.name.toUpperCase(),W/2,20);
+  }
+}
+function drawDecos(room,cx,cy){
+  const fps=[380,900,1420,1960,2280];
+  fps.forEach((fpx,i)=>{
+    const fx=fpx-cx+CAM.shx, fy=62+(i%3)*22-cy+CAM.shy;
+    if(fx>-130&&fx<W+130){
+      ctx.globalAlpha=.2;
+      ctx.strokeStyle='#3a2a10'; ctx.lineWidth=7; ctx.strokeRect(fx-40,fy-30,80,60);
+      ctx.fillStyle=PAINT[i%PAINT.length]; ctx.fillRect(fx-33,fy-23,66,46);
+      ctx.globalAlpha=.55; ctx.fillStyle='#04030a';
+      ctx.beginPath(); ctx.arc(fx,fy,17,0,Math.PI*2); ctx.fill();
+      ctx.globalAlpha=1;
+    }
+  });
+}
+
+// ── HUD ───────────────────────────────────────────────────────────
+let gTime=0;
+function drawHUD(){
+  for(let i=0;i<PL.maxHp;i++){
+    const x=16+i*21, y=16, ok=i<PL.hp;
+    ctx.fillStyle=ok?COL.hp:COL.hpEmpty;
+    ctx.shadowColor=ok?COL.hp:'transparent'; ctx.shadowBlur=ok?8:0;
+    rRect(x,y,14,28,3); ctx.fill();
+    ctx.fillStyle=ok?'#b8b8b8':'#2a2a2a'; ctx.shadowBlur=0;
+    ctx.fillRect(x+2,y-4,10,6);
+    if(ok){ctx.globalAlpha=.22;ctx.fillStyle='#fff';ctx.fillRect(x+2,y+5,4,13);ctx.globalAlpha=1;}
+  }
+  ROOMS.forEach((_,i)=>{
+    const active=i===roomIdx;
+    ctx.fillStyle=active?'#8888ee':'#222240';
+    ctx.shadowColor=active?'#8888ee':'none'; ctx.shadowBlur=active?8:0;
+    ctx.beginPath(); ctx.arc(W/2-16+i*16,14,4,0,Math.PI*2); ctx.fill();
+  });
+  ctx.shadowBlur=0;
+  if(gTime<4.5){
+    ctx.globalAlpha=Math.max(0,1-gTime/3.5);
+    ctx.fillStyle='#3a3c60'; ctx.font='11px Georgia,serif'; ctx.textAlign='center';
+    ctx.fillText('← → Mover  ·  Espacio Saltar (doble)  ·  Z Atacar',W/2,H-12);
+    ctx.globalAlpha=1;
+  }
+}
+
+// ── PANTALLAS ────────────────────────────────────────────────────
+function drawMenu(){
+  const g=ctx.createLinearGradient(0,0,0,H);
+  g.addColorStop(0,'#040508'); g.addColorStop(1,'#0b0916');
+  ctx.fillStyle=g; ctx.fillRect(0,0,W,H);
+  const t=Date.now()/1000;
+  PAINT.forEach((col,i)=>{
+    ctx.strokeStyle=col; ctx.lineWidth=1.5;
+    ctx.globalAlpha=.05+Math.sin(t+i)*.025;
+    ctx.beginPath(); ctx.moveTo(0,H*(i/PAINT.length));
+    for(let x=0;x<=W;x+=22) ctx.lineTo(x,H*(i/PAINT.length)+Math.sin(x*.012+t+i)*72);
+    ctx.stroke();
+  }); ctx.globalAlpha=1;
+  ctx.shadowColor='#3030a0'; ctx.shadowBlur=40;
+  ctx.fillStyle='#cccde8'; ctx.font='bold 52px Georgia,serif'; ctx.textAlign='center';
+  ctx.fillText('El Último Trazo',W/2,H/2-62); ctx.shadowBlur=0;
+  ctx.fillStyle='#484870'; ctx.font='italic 15px Georgia,serif';
+  ctx.fillText('Una travesía por la academia olvidada',W/2,H/2-24);
+  ctx.strokeStyle='#28285a'; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.moveTo(W/2-195,H/2-5); ctx.lineTo(W/2+195,H/2-5); ctx.stroke();
+  const bl=Math.sin(Date.now()/400)>0;
+  ctx.fillStyle=bl?'#8888c0':'#484868'; ctx.font='13px Georgia,serif';
+  ctx.fillText('Presiona ENTER para comenzar',W/2,H/2+30);
+  ctx.fillStyle='#2c2c50'; ctx.font='11px Georgia,serif';
+  ctx.fillText('← →  Mover   |   Espacio  Saltar (doble)   |   Z  Atacar',W/2,H/2+62);
+  ctx.strokeStyle='#14142c'; ctx.lineWidth=2;
+  ctx.strokeRect(8,8,W-16,H-16); ctx.strokeStyle='#20204a'; ctx.strokeRect(14,14,W-28,H-28);
+}
+function drawDead(){
+  ctx.fillStyle='rgba(0,0,0,.78)'; ctx.fillRect(0,0,W,H);
+  ctx.shadowColor='#800000'; ctx.shadowBlur=50;
+  ctx.fillStyle='#c03030'; ctx.font='bold 42px Georgia,serif'; ctx.textAlign='center';
+  ctx.fillText('La tela se rasgó',W/2,H/2-30); ctx.shadowBlur=0;
+  ctx.fillStyle='#804040'; ctx.font='italic 15px Georgia,serif';
+  ctx.fillText('El artista cae… pero la obra perdura',W/2,H/2+10);
+  const bl=Math.sin(Date.now()/500)>0;
+  ctx.fillStyle=bl?'#a06060':'#604040'; ctx.font='13px Georgia,serif';
+  ctx.fillText('ENTER para intentarlo de nuevo',W/2,H/2+54);
+}
+function drawWin(){
+  ctx.fillStyle='rgba(2,2,12,.88)'; ctx.fillRect(0,0,W,H);
+  const t=Date.now()/1000;
+  for(let i=0;i<26;i++){
+    const px=(Math.sin(i*2.4+t)*.5+.5)*W;
+    const py=((t*.08*(i+1))%1.35-.12)*H;
+    ctx.globalAlpha=.55; ctx.fillStyle=PAINT[i%PAINT.length];
+    ctx.beginPath(); ctx.ellipse(px,py,4,9,t+i,0,Math.PI*2); ctx.fill();
+  }
+  ctx.globalAlpha=1;
+  ctx.shadowColor='#6040ff'; ctx.shadowBlur=45;
+  ctx.fillStyle='#c8c4ff'; ctx.font='bold 40px Georgia,serif'; ctx.textAlign='center';
+  ctx.fillText('Obra Completada',W/2,H/2-42); ctx.shadowBlur=0;
+  ctx.fillStyle='#7070b0'; ctx.font='italic 15px Georgia,serif';
+  ctx.fillText('El lienzo corrupto ha sido restaurado',W/2,H/2+2);
+  ctx.fillText('La academia vuelve a la vida',W/2,H/2+26);
+  const bl=Math.sin(Date.now()/500)>0;
+  ctx.fillStyle=bl?'#8888cc':'#484870'; ctx.font='13px Georgia,serif';
+  ctx.fillText('ENTER para volver al menú',W/2,H/2+66);
+}
+
+// ── GESTIÓN DE SALAS ─────────────────────────────────────────────
+let roomIdx=0;
+let TRANS={active:false,alpha:0,dir:1,target:0};
+function loadRoom(idx){
+  roomIdx=idx; ENEMS=ROOMS[idx].enems.map(mkEnemy);
+  if(ROOMS[idx].boss&&!BOSS)BOSS=mkBoss();
+  CAM.x=0; CAM.y=0;
+}
+function checkTrans(){
+  const r=ROOMS[roomIdx];
+  if(!r.transit||TRANS.active)return;
+  if(hit(PL,r.transit)){TRANS.active=true;TRANS.dir=1;TRANS.alpha=0;TRANS.target=roomIdx+1;}
+}
+function updateTrans(dt){
+  if(!TRANS.active)return;
+  TRANS.alpha+=dt*2.2;
+  if(TRANS.alpha>=1&&TRANS.dir===1){
+    PL.x=80;PL.y=380;PL.vx=0;PL.vy=0;
+    loadRoom(TRANS.target);TRANS.dir=-1;
+  }
+  if(TRANS.dir===-1){
+    TRANS.alpha-=dt*2.2;
+    if(TRANS.alpha<=0){TRANS.active=false;TRANS.alpha=0;}
+  }
+}
+
+// ── MÁQUINA DE ESTADOS ───────────────────────────────────────────
+let STATE='menu', lastT=0;
+function setState(s){STATE=s;}
+function resetGame(){
+  PL=mkPlayer(100,380); ENEMS=[]; BOSS=null; PARTS.length=0;
+  CAM.x=0;CAM.y=0; roomIdx=0; gTime=0; eid=0;
+  TRANS.active=false; loadRoom(0);
+}
+
+// ── LOOP PRINCIPAL ───────────────────────────────────────────────
+function frame(ts){
+  requestAnimationFrame(frame);
+  const dt=Math.min((ts-lastT)/1000,.05); lastT=ts;
+  ctx.clearRect(0,0,W,H);
+
+  if(STATE==='menu'){
+    drawMenu();
+    if(JD.has('Enter')||JD.has('Space')){resetGame();setState('playing');}
+
+  } else if(STATE==='playing'){
+    gTime+=dt;
+    const room=ROOMS[roomIdx];
+    if(PL.y>room.h+100&&!PL.dead)hurtPl(3);
+    plUpdate(dt,room.plats);
+    eUpdate(dt,room.plats);
+    if(room.boss)bossUpdate(dt,room.plats);
+    pUpdate(dt); updateTrans(dt);
+    camUpdate(PL.x+PL.w/2,PL.y+PL.h/2,room.w,room.h);
+    const cx=CAM.x|0, cy=CAM.y|0;
+    drawBG(room,cx,cy);
+    drawDecos(room,cx,cy);
+    drawPlats(room,cx,cy);
+    pDraw(cx,cy);
+    eDraw(cx,cy);
+    if(room.boss)bossDraw(cx,cy);
+    plDraw(cx,cy);
+    drawHUD();
+    // Texto de entrada al jefe
+    if(room.boss&&BOSS&&!BOSS.active&&BOSS.entryT<2.5){
+      const a=Math.min(1,(2.5-BOSS.entryT)/.6)*Math.min(1,BOSS.entryT/.4);
+      ctx.globalAlpha=a*.9; ctx.fillStyle='#c8a060';
+      ctx.font='italic 22px Georgia,serif'; ctx.textAlign='center';
+      ctx.fillText('El Lienzo Corrupto despierta…',W/2,H/2+100);
+      ctx.globalAlpha=1;
+    }
+    if(TRANS.active&&TRANS.alpha>0){
+      ctx.fillStyle=`rgba(0,0,0,${clamp(TRANS.alpha,0,1)})`;
+      ctx.fillRect(0,0,W,H);
+    }
+
+  } else if(STATE==='dead'){
+    ctx.fillStyle='#020206'; ctx.fillRect(0,0,W,H);
+    drawDead();
+    if(JD.has('Enter')||JD.has('Space'))setState('menu');
+
+  } else if(STATE==='win'){
+    ctx.fillStyle='#020208'; ctx.fillRect(0,0,W,H);
+    drawWin(); pUpdate(dt); pDraw(0,0);
+    if(JD.has('Enter')||JD.has('Space'))setState('menu');
+  }
+  JD.clear();
+}
+requestAnimationFrame(ts=>{lastT=ts;requestAnimationFrame(frame);});
+</script>
+</body>
+</html>
